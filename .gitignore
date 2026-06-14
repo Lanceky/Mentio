@@ -45,3 +45,4 @@ app-example
 
 # editor / tool config
 .vscode/
+.claude/
