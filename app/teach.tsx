@@ -18,7 +18,14 @@ import { MentioScene } from '@/components/mentio/MentioScene';
 import { TypingDots } from '@/components/mentio/TypingDots';
 import { AGE_BANDS, Mentio } from '@/constants/theme';
 import { getTopic } from '@/constants/topics';
-import { generateReply, opener, reactToMaterial, type MentioReply } from '@/lib/confusion-engine';
+import {
+    mentioOnDocument,
+    mentioOpener,
+    mentioRespond,
+    type ChatTurn,
+    type MentioOutcome,
+} from '@/lib/deepseek';
+import { loadDocumentText, type LoadDocumentResult, type LoadedDocument } from '@/lib/document';
 import { usePreferences } from '@/providers/preferences';
 
 type Message = {
@@ -41,82 +48,213 @@ export default function Teach() {
     const [messages, setMessages] = useState<Message[]>([]);
     const [draft, setDraft] = useState('');
     const [mood, setMood] = useState<MentioMood>('curious');
-    const [userTurns, setUserTurns] = useState(0);
     const [typing, setTyping] = useState(false);
+    const [reading, setReading] = useState(false);
+    const [doc, setDoc] = useState<LoadedDocument | null>(null);
+    // Lets the learner retry Mentio's last line if the model couldn't be reached.
+    const [retry, setRetry] = useState<(() => Promise<MentioOutcome>) | null>(null);
 
     const scrollRef = useRef<ScrollView>(null);
     const typingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const alive = useRef(true);
 
-    // Seed the conversation with Mentio's opening confusion.
-    useEffect(() => {
-        const first = opener(topicId, age);
-        setMessages([{ id: nextId(), from: 'mentio', text: first.text }]);
-        setMood(first.mood);
-        setUserTurns(0);
-    }, [topicId, age]);
-
-    // Clean up any pending typing timer on unmount.
-    useEffect(() => {
-        return () => {
-            if (typingTimer.current) clearTimeout(typingTimer.current);
-        };
-    }, []);
+    // The chat so far, mapped to DeepSeek roles (Mentio = assistant, learner = user).
+    // Defined before the seeding effect because that effect re-greets on changes.
+    const buildHistory = useCallback(
+        (): ChatTurn[] =>
+            messages
+                .filter((m) => m.from === 'mentio' || m.from === 'user')
+                .map((m) => ({
+                    role: m.from === 'mentio' ? 'assistant' : 'user',
+                    content: m.text,
+                })),
+        [messages]
+    );
 
     const scrollToEnd = useCallback(() => {
         requestAnimationFrame(() => scrollRef.current?.scrollToEnd({ animated: true }));
     }, []);
 
     /**
-     * Mentio never answers instantly. He "thinks" first: the typing dots appear,
-     * then after a beat (scaled to how much he's about to say) the reply lands.
+     * Mentio never answers instantly. The typing dots show while DeepSeek thinks,
+     * and stay up for at least a short beat so the reply never snaps in. `produce`
+     * returns an honest outcome: on success we append the model's line; on failure
+     * we say so and stash the call so the learner can retry — we never fabricate a
+     * reply.
      */
-    const respondWithDelay = useCallback(
-        (reply: MentioReply) => {
-            setMood(reply.mood);
+    const respond = useCallback(
+        async (produce: () => Promise<MentioOutcome>) => {
+            setRetry(null);
             setTyping(true);
             scrollToEnd();
 
-            const think = 700 + Math.min(1600, reply.text.length * 28);
-            typingTimer.current = setTimeout(() => {
-                setTyping(false);
-                setMessages((prev) => [...prev, { id: nextId(), from: 'mentio', text: reply.text }]);
-                scrollToEnd();
-            }, think);
+            const minBeat = new Promise<void>((resolve) => {
+                typingTimer.current = setTimeout(resolve, 650);
+            });
+
+            let outcome: MentioOutcome;
+            try {
+                const [result] = await Promise.all([produce(), minBeat]);
+                outcome = result;
+            } catch {
+                outcome = { ok: false, error: 'offline' };
+            }
+
+            if (!alive.current) return;
+            setTyping(false);
+
+            if (outcome.ok) {
+                setMood(outcome.reply.mood);
+                setMessages((prev) => [
+                    ...prev,
+                    { id: nextId(), from: 'mentio', text: outcome.reply.text },
+                ]);
+            } else {
+                setMood('curious');
+                const note =
+                    outcome.error === 'no-key'
+                        ? 'Mentio isn’t connected yet — add a DeepSeek API key to wake him up.'
+                        : 'Mentio couldn’t reach his brain just now. Check your connection and tap retry.';
+                setMessages((prev) => [...prev, { id: nextId(), from: 'system', text: note }]);
+                // Only a network problem is worth retrying; a missing key is not.
+                if (outcome.error === 'offline') setRetry(() => produce);
+            }
+            scrollToEnd();
         },
         [scrollToEnd]
     );
 
+    // Seed the conversation: Mentio greets and asks which topic in the subject
+    // we'll cover. Generated by the model, like every other line.
+    useEffect(() => {
+        setMessages([]);
+        setDoc(null);
+        setMood('curious');
+        respond(() => mentioOpener({ age, topicTitle: topic.title, learnerName: name }));
+        // Re-greet when the subject or age changes; respond/name are stable enough
+        // that including them would only cause a redundant re-greet.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [topic, age]);
+
+    // Clean up any pending typing timer on unmount.
+    useEffect(() => {
+        return () => {
+            alive.current = false;
+            if (typingTimer.current) clearTimeout(typingTimer.current);
+        };
+    }, []);
+
     const send = () => {
         const text = draft.trim();
-        if (!text || typing) return;
+        if (!text || typing || reading) return;
         setDraft('');
 
-        const turn = userTurns;
+        const history = buildHistory();
         setMessages((prev) => [...prev, { id: nextId(), from: 'user', text }]);
-        setUserTurns((n) => n + 1);
         scrollToEnd();
 
-        respondWithDelay(generateReply({ topicId, age, userText: text, turn }));
+        respond(() =>
+            mentioRespond({
+                age,
+                topicTitle: topic.title,
+                history,
+                userText: text,
+                learnerName: name,
+                doc: doc ?? undefined,
+            })
+        );
     };
 
     const upload = async () => {
-        if (typing) return;
-        try {
-            const result = await DocumentPicker.getDocumentAsync({
-                type: ['application/pdf', 'text/*', 'image/*'],
-                copyToCacheDirectory: true,
-            });
-            if (result.canceled || !result.assets?.length) return;
-            const file = result.assets[0];
+        if (typing || reading) return;
 
-            setMessages((prev) => [
-                ...prev,
-                { id: nextId(), from: 'system', text: `\u{1F4CE} Added “${file.name}”` },
-            ]);
-            scrollToEnd();
-            respondWithDelay(reactToMaterial(file.name, topicId, age));
+        // Open the picker first; bail quietly if it's dismissed or errors.
+        const picked = await (async () => {
+            try {
+                const result = await DocumentPicker.getDocumentAsync({
+                    type: [
+                        'text/*',
+                        'application/json',
+                        'application/pdf',
+                        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                    ],
+                    copyToCacheDirectory: true,
+                });
+                if (result.canceled || !result.assets?.length) return null;
+                return result.assets[0];
+            } catch {
+                return null;
+            }
+        })();
+        if (!picked) return;
+        const file = picked;
+
+        // Immediate, visible sign that the upload landed and is being read. PDFs
+        // take a moment to parse, so this shows BEFORE the slow extraction starts.
+        const statusId = nextId();
+        setReading(true);
+        setMessages((prev) => [
+            ...prev,
+            { id: statusId, from: 'system', text: `\u{1F4CE} Reading “${file.name}”…` },
+        ]);
+        scrollToEnd();
+
+        const history = buildHistory();
+        let loaded: LoadDocumentResult;
+        try {
+            loaded = await loadDocumentText({
+                uri: file.uri,
+                name: file.name,
+                mimeType: file.mimeType,
+                size: file.size,
+            });
         } catch {
-            // Picker failures are non-fatal; ignore so the loop keeps going.
+            loaded = { ok: false, reason: 'error' };
+        } finally {
+            if (alive.current) setReading(false);
+        }
+        if (!alive.current) return;
+
+        const setStatus = (text: string) =>
+            setMessages((prev) => prev.map((m) => (m.id === statusId ? { ...m, text } : m)));
+
+        if (loaded.ok) {
+            // Text pulled out — keep it as context so Mentio's questions revolve
+            // around the document, and have him open on something specific in it.
+            setDoc(loaded.doc);
+            setStatus(
+                `\u{1F4CE} Studying “${loaded.doc.name}”${loaded.doc.truncated ? ' (first part)' : ''}`
+            );
+            scrollToEnd();
+            respond(() =>
+                mentioOnDocument({
+                    age,
+                    topicTitle: topic.title,
+                    history,
+                    learnerName: name,
+                    file: { name: loaded.doc.name, readable: true, doc: loaded.doc },
+                })
+            );
+        } else {
+            // Couldn't read it (scanned PDF, image, empty, or a parse error) — say so
+            // plainly, then Mentio asks the learner to explain the material instead.
+            const note =
+                loaded.reason === 'unsupported'
+                    ? `\u{1F4CE} “${file.name}” — I can’t read that file type yet`
+                    : loaded.reason === 'empty'
+                        ? `\u{1F4CE} “${file.name}” — I couldn’t find any text in it`
+                        : `\u{1F4CE} “${file.name}” — I had trouble reading that one`;
+            setStatus(note);
+            scrollToEnd();
+            respond(() =>
+                mentioOnDocument({
+                    age,
+                    topicTitle: topic.title,
+                    history,
+                    learnerName: name,
+                    file: { name: file.name, readable: false },
+                })
+            );
         }
     };
 
@@ -179,13 +317,28 @@ export default function Teach() {
                             <TypingDots color={Mentio.inkSoft} />
                         </View>
                     )}
+
+                    {/* Couldn't reach the model — offer an honest retry instead of faking a reply */}
+                    {retry && !typing && (
+                        <Pressable
+                            onPress={() => {
+                                const again = retry;
+                                setRetry(null);
+                                respond(again);
+                            }}
+                            style={styles.retryBtn}>
+                            <Text style={styles.retryText}>↻  Tap to retry</Text>
+                        </Pressable>
+                    )}
                 </ScrollView>
 
-                {/* Upload hint — nudge the learner to add their study material */}
+                {/* Upload hint — nudge the learner to add study material, or show the active doc */}
                 <Pressable onPress={upload} style={styles.uploadHint}>
                     <Text style={styles.uploadHintIcon}>📄</Text>
-                    <Text style={styles.uploadHintText}>
-                        Got notes or a worksheet? Upload it so Mentio can ask about it.
+                    <Text style={styles.uploadHintText} numberOfLines={1}>
+                        {doc
+                            ? `Studying “${doc.name}” — tap to change`
+                            : 'Got notes or a worksheet? Upload it so Mentio asks about it.'}
                     </Text>
                 </Pressable>
 
@@ -305,6 +458,18 @@ const styles = StyleSheet.create({
     typingBubble: {
         paddingVertical: 14,
         paddingHorizontal: 18,
+    },
+    retryBtn: {
+        alignSelf: 'center',
+        paddingHorizontal: 18,
+        paddingVertical: 9,
+        borderRadius: 999,
+        backgroundColor: Mentio.ink,
+    },
+    retryText: {
+        fontSize: 13.5,
+        fontWeight: '800',
+        color: Mentio.chalk,
     },
     system: {
         alignSelf: 'center',
