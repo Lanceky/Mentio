@@ -3,7 +3,6 @@ import { useRouter } from 'expo-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
     KeyboardAvoidingView,
-    Platform,
     Pressable,
     ScrollView,
     StyleSheet,
@@ -283,8 +282,8 @@ export default function Teach() {
 
             <KeyboardAvoidingView
                 style={styles.flex}
-                behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-                keyboardVerticalOffset={8}>
+                behavior="padding"
+                keyboardVerticalOffset={0}>
                 {/* Conversation */}
                 <ScrollView
                     ref={scrollRef}
